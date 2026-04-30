@@ -1,4 +1,4 @@
-# Uploader — Guide complet
+# Uploader from Claude AI — Guide complet
 
 > Classe PHP 8.4/8.5 pour l'upload, le traitement d'images et le streaming navigateur.
 
