@@ -249,6 +249,8 @@ class Uploader
     private readonly array $mimeMap;
     private readonly array $scriptBlacklist;
 
+    private array $backgroundColor = [255, 255, 255]; // blanc par défaut
+
     // ─────────────────────────────────────────────────────────────────────────
     // Constructeur
     // ─────────────────────────────────────────────────────────────────────────
@@ -526,6 +528,37 @@ class Uploader
 
         // Streaming pur : on traite vers un fichier temporaire, on streame, on supprime
         return $this->processAndStream();
+    }
+
+
+    public function backgroundColor(int $r, int $g, int $b): static {
+        $this->backgroundColor = [
+            max(0, min(255, $r)),
+            max(0, min(255, $g)),
+            max(0, min(255, $b)),
+        ];
+        return $this;
+    }
+
+
+
+    private function flattenToBackground(\GdImage $src): \GdImage
+    {
+        $w = imagesx($src);
+        $h = imagesy($src);
+
+        $dst = imagecreatetruecolor($w, $h);
+
+        [$r, $g, $b] = $this->backgroundColor;
+        $bg = imagecolorallocate($dst, $r, $g, $b);
+
+        imagefilledrectangle($dst, 0, 0, $w, $h, $bg);
+
+        // Fusion avec alpha
+        imagealphablending($dst, true);
+        imagecopy($dst, $src, 0, 0, 0, 0, $w, $h);
+
+        return $dst;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -915,6 +948,7 @@ class Uploader
     private function processAndStream(): UploadResult
     {
         if (!$this->uploaded) {
+            $this->serveFallbackImage();
             return $this->failResult($this->error ?: 'Aucun fichier chargé.');
         }
 
@@ -986,6 +1020,22 @@ class Uploader
             error:     null,
             success:   true,
         );
+    }
+
+
+    private function serveFallbackImage(): void
+    {
+        http_response_code(404);
+        header('Content-Type: image/png');
+
+        $img = imagecreatetruecolor(240, 240);
+        $bg  = imagecolorallocate($img, 240, 240, 240);
+        imagefill($img, 0, 0, $bg);
+
+        imagestring($img, 5, 80, 120, 'Not Found', imagecolorallocate($img, 100, 100, 100));
+
+        imagepng($img);
+        exit;
     }
 
     /**
@@ -1153,6 +1203,17 @@ class Uploader
         }
 
         $format  = $this->resolveOutputFormat();
+
+        $hasAlpha = in_array($this->srcMime, [
+            'image/png',
+            'image/webp',
+            'image/gif'
+        ], true);
+
+        if ($format === ImageFormat::Jpeg && $hasAlpha) {
+            $dst = $this->flattenToBackground($dst);
+        }
+
         $success = $this->gdSave($dst, $destPathname, $format);
 
         if (!$success) {
