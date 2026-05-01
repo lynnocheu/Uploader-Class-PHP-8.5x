@@ -198,6 +198,14 @@ class Uploader
     private ?string $browserOutput  = null;
     /** Nom suggéré pour le téléchargement (Content-Disposition filename=). */
     private ?string $browserName    = null;
+    /** Streame une image vide si la source est manquante/invalide (serve() uniquement). */
+    private bool    $fallbackEnabled = false;
+    /** Largeur en pixels de l'image de fallback. */
+    private int     $fallbackW       = 1;
+    /** Hauteur en pixels de l'image de fallback. */
+    private int     $fallbackH       = 1;
+    /** Couleur de fond du fallback [R, G, B] — null = transparent (PNG). */
+    private ?array  $fallbackColor   = null;
 
     // ── Config validation ─────────────────────────────────────────────────────
 
@@ -229,6 +237,12 @@ class Uploader
     private int          $webpQuality    = 85;
     private ?int         $pngCompression = null;
     private bool         $interlace      = false;
+    /**
+     * Couleur de fond appliquée lors de la conversion vers un format
+     * sans transparence (JPEG, BMP). Format : [R, G, B] chaque valeur 0–255.
+     * null = blanc par défaut.
+     */
+    private ?array       $flattenBg      = null;
 
     // ── Config transformations ────────────────────────────────────────────────
 
@@ -248,8 +262,6 @@ class Uploader
 
     private readonly array $mimeMap;
     private readonly array $scriptBlacklist;
-
-    private array $backgroundColor = [255, 255, 255]; // blanc par défaut
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constructeur
@@ -514,51 +526,76 @@ class Uploader
      * @return UploadResult
      */
     public function serve(
-        ?string $destDir    = null,
-        bool    $download   = false,
+        ?string $destDir     = null,
+        bool    $download    = false,
         ?string $browserName = null,
     ): UploadResult {
         $this->browserOutput = $download ? 'attachment' : 'inline';
         $this->browserName   = $browserName;
 
-        if ($destDir !== null) {
-            // Sauvegarde sur disque ET streaming
-            return $this->process($destDir);
+        // Le fallback est activé par défaut pour serve() sauf si noFallback() a été appelé
+        if (!$this->fallbackEnabled) {
+            $this->fallbackEnabled = true;
         }
 
-        // Streaming pur : on traite vers un fichier temporaire, on streame, on supprime
-        return $this->processAndStream();
+        if ($destDir !== null) {
+            // Sauvegarde sur disque ET streaming
+            $result = $this->process($destDir);
+        } else {
+            // Streaming pur : on traite vers un fichier temporaire, on streame, on supprime
+            $result = $this->processAndStream();
+        }
+
+        // Si le traitement a échoué et que le fallback est actif, on diffuse une image vide
+        if (!$result->success && $this->fallbackEnabled) {
+            $this->streamBlankImage();
+        }
+
+        return $result;
     }
 
-
-    public function backgroundColor(int $r, int $g, int $b): static {
-        $this->backgroundColor = [
-            max(0, min(255, $r)),
-            max(0, min(255, $g)),
-            max(0, min(255, $b)),
-        ];
+    /**
+     * Active l'image de remplacement (fallback) diffusée par serve() quand
+     * la source est absente, invalide ou que le traitement échoue.
+     * Par défaut le fallback est activé automatiquement par serve().
+     *
+     * @param int          $width   Largeur de l'image vide (px, défaut 1).
+     * @param int          $height  Hauteur de l'image vide (px, défaut 1).
+     * @param string|array $color   Couleur de fond : 'white', 'black', '#rrggbb',
+     *                              [R,G,B] ou null pour un PNG transparent.
+     *
+     * Exemples :
+     *   ->serve()                               // fallback 1×1 transparent
+     *   ->fallback(400, 300)->serve()           // fallback gris 400×300
+     *   ->fallback(400, 300, '#cccccc')->serve()
+     *   ->fallback(400, 300, 'black')->serve()
+     */
+    public function fallback(int $width = 1, int $height = 1, string|array|null $color = null): static
+    {
+        $this->fallbackEnabled = true;
+        $this->fallbackW       = max(1, $width);
+        $this->fallbackH       = max(1, $height);
+        $this->fallbackColor   = match (true) {
+            $color === null   => null,
+            is_array($color)  => [
+                max(0, min(255, (int) ($color[0] ?? 200))),
+                max(0, min(255, (int) ($color[1] ?? 200))),
+                max(0, min(255, (int) ($color[2] ?? 200))),
+            ],
+            default => match (strtolower(trim((string) $color))) {
+                'white', 'blanc' => [255, 255, 255],
+                'black', 'noir'  => [0,   0,   0],
+                default          => $this->parseHexColor((string) $color),
+            },
+        };
         return $this;
     }
 
-
-
-    private function flattenToBackground(\GdImage $src): \GdImage
+    /** Désactive le fallback pour cet appel serve() / process(). */
+    public function noFallback(): static
     {
-        $w = imagesx($src);
-        $h = imagesy($src);
-
-        $dst = imagecreatetruecolor($w, $h);
-
-        [$r, $g, $b] = $this->backgroundColor;
-        $bg = imagecolorallocate($dst, $r, $g, $b);
-
-        imagefilledrectangle($dst, 0, 0, $w, $h, $bg);
-
-        // Fusion avec alpha
-        imagealphablending($dst, true);
-        imagecopy($dst, $src, 0, 0, 0, 0, $w, $h);
-
-        return $dst;
+        $this->fallbackEnabled = false;
+        return $this;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -732,6 +769,39 @@ class Uploader
     public function interlace(bool $v = true): static
     {
         $this->interlace = $v;
+        return $this;
+    }
+
+    /**
+     * Couleur de fond appliquée lors de la conversion vers un format sans
+     * canal alpha (JPEG, BMP). Sans appel, le fond est blanc.
+     *
+     * Formats acceptés :
+     *   ->flattenBackground('white')        // blanc (défaut)
+     *   ->flattenBackground('black')        // noir
+     *   ->flattenBackground([255, 0, 0])    // rouge RGB
+     *   ->flattenBackground('#1a2b3c')      // hex 6 caractères
+     *   ->flattenBackground('#fff')         // hex 3 caractères
+     *
+     * @param string|array $color  'white', 'black', [R, G, B] ou '#rrggbb'.
+     */
+    public function flattenBackground(string|array $color): static
+    {
+        if (is_array($color)) {
+            $this->flattenBg = [
+                max(0, min(255, (int) ($color[0] ?? 255))),
+                max(0, min(255, (int) ($color[1] ?? 255))),
+                max(0, min(255, (int) ($color[2] ?? 255))),
+            ];
+            return $this;
+        }
+
+        $this->flattenBg = match (strtolower(trim($color))) {
+            'white', 'blanc' => [255, 255, 255],
+            'black', 'noir'  => [0,   0,   0],
+            default          => $this->parseHexColor($color),
+        };
+
         return $this;
     }
 
@@ -948,7 +1018,6 @@ class Uploader
     private function processAndStream(): UploadResult
     {
         if (!$this->uploaded) {
-            $this->serveFallbackImage();
             return $this->failResult($this->error ?: 'Aucun fichier chargé.');
         }
 
@@ -1022,20 +1091,71 @@ class Uploader
         );
     }
 
-
-    private function serveFallbackImage(): void
+    /**
+     * Génère et streame une image vide (placeholder) directement vers le navigateur.
+     * Utilisée par serve() quand la source est absente ou invalide.
+     *
+     * - Avec GD : image PNG ou JPEG aux dimensions et couleur configurées.
+     * - Sans GD : PNG 1×1 transparent encodé en dur (aucune dépendance).
+     */
+    private function streamBlankImage(): void
     {
-        http_response_code(404);
+        if (headers_sent()) {
+            return;
+        }
+
+        // ── Génération via GD ──────────────────────────────────────────────
+        if (extension_loaded('gd')) {
+            $w   = $this->fallbackW;
+            $h   = $this->fallbackH;
+            $img = imagecreatetruecolor($w, $h);
+
+            if ($this->fallbackColor !== null) {
+                // Fond coloré opaque
+                [$r, $g, $b] = $this->fallbackColor;
+                $bg = imagecolorallocate($img, $r, $g, $b);
+                imagefilledrectangle($img, 0, 0, $w - 1, $h - 1, $bg);
+                $mime = 'image/png';
+                ob_start();
+                imagepng($img);
+                $data = (string) ob_get_clean();
+            } else {
+                // Fond transparent (PNG uniquement)
+                imagealphablending($img, false);
+                $transparent = imagecolorallocatealpha($img, 0, 0, 0, 127);
+                imagefilledrectangle($img, 0, 0, $w - 1, $h - 1, $transparent);
+                imagesavealpha($img, true);
+                $mime = 'image/png';
+                ob_start();
+                imagepng($img);
+                $data = (string) ob_get_clean();
+            }
+
+            while (ob_get_level() > 0) ob_end_clean();
+
+            header('Content-Type: ' . $mime);
+            header('Content-Disposition: inline; filename="blank.png"');
+            header('Content-Length: ' . strlen($data));
+            header('Cache-Control: no-store');
+            header('X-Content-Type-Options: nosniff');
+            echo $data;
+            return;
+        }
+
+        // ── Fallback sans GD : PNG 1×1 transparent encodé en base64 ──────
+        // Octets d'un PNG 1×1 transparent valide — aucune dépendance requise.
+        $png = base64_decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+        );
+
+        while (ob_get_level() > 0) ob_end_clean();
+
         header('Content-Type: image/png');
-
-        $img = imagecreatetruecolor(240, 240);
-        $bg  = imagecolorallocate($img, 240, 240, 240);
-        imagefill($img, 0, 0, $bg);
-
-        imagestring($img, 5, 80, 120, 'Not Found', imagecolorallocate($img, 100, 100, 100));
-
-        imagepng($img);
-        exit;
+        header('Content-Disposition: inline; filename="blank.png"');
+        header('Content-Length: ' . strlen($png));
+        header('Cache-Control: no-store');
+        header('X-Content-Type-Options: nosniff');
+        echo $png;
     }
 
     /**
@@ -1203,17 +1323,6 @@ class Uploader
         }
 
         $format  = $this->resolveOutputFormat();
-
-        $hasAlpha = in_array($this->srcMime, [
-            'image/png',
-            'image/webp',
-            'image/gif'
-        ], true);
-
-        if ($format === ImageFormat::Jpeg && $hasAlpha) {
-            $dst = $this->flattenToBackground($dst);
-        }
-
         $success = $this->gdSave($dst, $destPathname, $format);
 
         if (!$success) {
@@ -1248,7 +1357,14 @@ class Uploader
             imageinterlace($img, true);
         }
 
-        imagesavealpha($img, true);
+        // Formats sans canal alpha : on aplatit la transparence sur la couleur de fond
+        $flatFormats = [ImageFormat::Jpeg, ImageFormat::Bmp];
+
+        if (in_array($format, $flatFormats, strict: true)) {
+            $img = $this->flattenAlpha($img);
+        } else {
+            imagesavealpha($img, true);
+        }
 
         return match ($format) {
             ImageFormat::Jpeg => imagejpeg($img, $path, $this->resolveJpegQuality($img)),
@@ -1257,6 +1373,27 @@ class Uploader
             ImageFormat::Webp => imagewebp($img, $path, $this->webpQuality),
             ImageFormat::Bmp  => imagebmp($img, $path),
         };
+    }
+
+    /**
+     * Aplatit le canal alpha sur une couleur de fond unie.
+     * Retourne une nouvelle image truecolor sans transparence.
+     */
+    private function flattenAlpha(\GdImage $src): \GdImage
+    {
+        $w = imagesx($src);
+        $h = imagesy($src);
+
+        [$r, $g, $b] = $this->flattenBg ?? [255, 255, 255];
+
+        $dst = imagecreatetruecolor($w, $h);
+        $bg  = imagecolorallocate($dst, $r, $g, $b);
+        imagefilledrectangle($dst, 0, 0, $w - 1, $h - 1, $bg);
+        imagealphablending($dst, true);
+        imagecopy($dst, $src, 0, 0, 0, 0, $w, $h);
+        imagealphablending($dst, false);
+
+        return $dst;
     }
 
     private function newCanvas(int $w, int $h): \GdImage
@@ -1864,6 +2001,11 @@ class Uploader
         $this->negative         = false;
         $this->browserOutput    = null;
         $this->browserName      = null;
+        $this->flattenBg        = null;
+        $this->fallbackEnabled  = false;
+        $this->fallbackW        = 1;
+        $this->fallbackH        = 1;
+        $this->fallbackColor    = null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1892,6 +2034,32 @@ class Uploader
             $bytes >= 1024      => round($bytes / 1024, 2) . ' Ko',
             default             => $bytes . ' o',
         };
+    }
+
+    /**
+     * Parse une couleur hexadecimale (#rrggbb ou #rgb) en [R, G, B].
+     * Retourne blanc [255, 255, 255] si le format est invalide.
+     *
+     * @return array{int, int, int}
+     */
+    private function parseHexColor(string $hex): array
+    {
+        $hex = ltrim(trim($hex), '#');
+
+        // Forme courte #rgb → #rrggbb
+        if (strlen($hex) === 3) {
+            $hex = $hex[0] . $hex[0] . $hex[1] . $hex[1] . $hex[2] . $hex[2];
+        }
+
+        if (strlen($hex) !== 6 || !ctype_xdigit($hex)) {
+            return [255, 255, 255]; // fallback blanc
+        }
+
+        return [
+            hexdec(substr($hex, 0, 2)),
+            hexdec(substr($hex, 2, 2)),
+            hexdec(substr($hex, 4, 2)),
+        ];
     }
 
     /**
