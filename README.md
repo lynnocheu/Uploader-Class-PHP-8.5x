@@ -1,4 +1,4 @@
-# Uploader from Claude AI — Guide complet
+# Uploader — Guide complet
 
 > Classe PHP 8.4/8.5 pour l'upload, le traitement d'images et le streaming navigateur.
 
@@ -17,7 +17,11 @@
    - [Transformations géométriques](#54-transformations-géométriques)
    - [Corrections colorimétriques](#55-corrections-colorimétriques)
    - [Qualité & compression](#56-qualité--compression)
+   - [Fond de conversion (flattenBackground)](#57-fond-de-conversion-flattenbackground)
 6. [Streaming navigateur](#6-streaming-navigateur)
+   - [display() & download()](#61-display--download)
+   - [serve() — streaming pur](#62-serve--streaming-pur)
+   - [Fallback — image de remplacement](#63-fallback--image-de-remplacement)
 7. [Multi-output (traitement multiple)](#7-multi-output-traitement-multiple)
 8. [Lecture des résultats](#8-lecture-des-résultats)
 9. [Recettes pratiques](#9-recettes-pratiques)
@@ -445,46 +449,91 @@ $uploader->interlace();
 
 ---
 
+### 5.7 Fond de conversion (flattenBackground)
+
+JPEG et BMP ne supportent pas le canal alpha. Lors d'une conversion depuis un PNG
+ou WebP avec transparence, les pixels transparents sont aplatis sur une couleur de fond.
+Sans appel explicite, le fond est **blanc**.
+
+```php
+// Fond blanc (comportement par défaut)
+$uploader
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground('white');
+
+// Fond noir
+$uploader
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground('black');
+
+// Couleur personnalisée en RGB
+$uploader
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground([34, 85, 120]);
+
+// Couleur hexadécimale (6 ou 3 caractères)
+$uploader
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground('#1a2b3c');
+
+$uploader
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground('#fff');
+```
+
+> **Remarque :** `flattenBackground()` n'a aucun effet si le format de sortie
+> supporte la transparence (PNG, WebP, GIF). Il est silencieusement ignoré
+> dans ces cas.
+
+#### Recette — Logo PNG sur fond coloré converti en JPEG
+
+```php
+$result = (new Uploader())
+    ->fromPath('/assets/logo.png')          // PNG avec fond transparent
+    ->resize(600, 200, ResizeMode::Fit)
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground('#0d1b2a')          // fond sombre personnalisé
+    ->jpegQuality(92)
+    ->process('/public/img/');
+```
+
+---
+
 ## 6. Streaming navigateur
 
 Trois façons d'envoyer le fichier directement au navigateur,
 sans redirection ni lien supplémentaire.
 
-### `->display()` — affichage inline
+### 6.1 display() & download()
 
-Sauvegarde sur disque **et** affiche dans le navigateur dans le même appel.
+Ces deux méthodes s'enchaînent avant `process()` et déclenchent le streaming
+**après** que le fichier a été enregistré sur disque.
 
 ```php
-// Image affichée directement dans le navigateur après traitement
+// Sauvegarde sur disque ET affiche dans le navigateur
 $result = (new Uploader())
     ->fromFiles($_FILES['photo'])
     ->resize(1200, 900, ResizeMode::Fit)
     ->convertTo(ImageFormat::Webp)
     ->webpQuality(80)
-    ->display()                      // ← active le streaming inline
+    ->display()                      // ← inline
     ->process('/var/www/uploads/');
 ```
 
-Typiquement appelé depuis un script PHP dédié (`/image.php?id=42`) qui
-joue le rôle de proxy d'image dynamique.
-
----
-
-### `->download()` — téléchargement forcé
-
 ```php
+// Sauvegarde ET force le téléchargement
 $result = (new Uploader())
     ->fromPath('/var/exports/rapport.pdf')
-    ->download('rapport-annuel-2024.pdf')   // nom suggéré au navigateur
+    ->download('rapport-annuel-2024.pdf')
     ->process('/var/exports/');
 ```
 
 ---
 
-### `->serve()` — streaming pur (sans écriture disque)
+### 6.2 serve() — streaming pur
 
 Idéal pour les images à la volée, les API d'images, les previews.
-**Aucun fichier n'est écrit de façon permanente.**
+**Aucun fichier n'est écrit de façon permanente** (sauf si `$destDir` est fourni).
 
 ```php
 // Streaming inline — aucun fichier sauvegardé
@@ -501,7 +550,7 @@ Idéal pour les images à la volée, les API d'images, les previews.
     ->fromFiles($_FILES['photo'])
     ->resize(800, 600)
     ->convertTo(ImageFormat::Webp)
-    ->serve('/var/www/uploads/');   // enregistre ET streame
+    ->serve('/var/www/uploads/');
 ```
 
 ```php
@@ -510,6 +559,68 @@ Idéal pour les images à la volée, les API d'images, les previews.
     ->fromPath('/tmp/export-' . $id . '.csv')
     ->serve(download: true, browserName: 'export.csv');
 ```
+
+---
+
+### 6.3 Fallback — image de remplacement
+
+`serve()` active automatiquement un **fallback** : si la source est absente,
+invalide ou que le traitement échoue, une image vide est diffusée à la place
+d'une erreur HTTP ou d'une page blanche. Aucune configuration requise.
+
+```php
+// Si le fichier n'existe pas → PNG 1×1 transparent automatiquement
+(new Uploader())
+    ->fromPath('/uploads/' . $id . '.jpg')
+    ->serve();
+```
+
+#### Personnaliser le placeholder
+
+```php
+// Placeholder gris neutre 400×300
+(new Uploader())
+    ->fromPath('/uploads/' . $id . '.jpg')
+    ->fallback(400, 300, '#cccccc')
+    ->serve();
+
+// Fond noir aux dimensions attendues
+(new Uploader())
+    ->fromPath('/uploads/' . $id . '.jpg')
+    ->fallback(800, 600, 'black')
+    ->serve();
+
+// Transparent (color omise)
+(new Uploader())
+    ->fromPath('/uploads/' . $id . '.jpg')
+    ->fallback(400, 300)
+    ->serve();
+
+// RGB
+(new Uploader())
+    ->fromPath('/uploads/' . $id . '.jpg')
+    ->fallback(400, 300, [240, 240, 240])
+    ->serve();
+```
+
+#### Désactiver le fallback
+
+Retourne un `UploadResult` avec `success = false` sans rien émettre.
+
+```php
+(new Uploader())
+    ->fromPath('/uploads/' . $id . '.jpg')
+    ->noFallback()
+    ->serve();
+```
+
+#### Comportement selon la disponibilité de GD
+
+| Situation | Résultat |
+|-----------|----------|
+| GD disponible + `fallback(w, h, color)` | PNG aux dimensions et couleur choisies |
+| GD disponible + `fallback(w, h)` | PNG transparent aux dimensions choisies |
+| GD absent | PNG 1×1 transparent encodé en dur (aucune dépendance) |
 
 ---
 
@@ -716,6 +827,10 @@ function processGalleryUpload(array $file, int $albumId): array
 
 ### API d'image dynamique (resize à la volée, sans écriture disque)
 
+Le fallback remplace avantageusement le `http_response_code(404)` : le navigateur
+reçoit toujours une image valide, ce qui évite les icônes d'image cassée dans
+les galeries ou les listes de produits.
+
 ```php
 // /api/image.php?id=42&w=400&h=300&fit=fill
 $id  = (int) ($_GET['id'] ?? 0);
@@ -723,19 +838,13 @@ $w   = min((int) ($_GET['w'] ?? 800), 2000);   // max 2000px
 $h   = min((int) ($_GET['h'] ?? 600), 2000);
 $fit = $_GET['fit'] === 'fill' ? ResizeMode::Fill : ResizeMode::Fit;
 
-$original = "/var/storage/originals/{$id}.jpg";
-
-if (!file_exists($original)) {
-    http_response_code(404);
-    exit;
-}
-
 (new Uploader())
-    ->fromPath($original)
+    ->fromPath("/var/storage/originals/{$id}.jpg")
     ->resize($w, $h, $fit)
     ->convertTo(ImageFormat::Webp)
     ->webpQuality(82)
-    ->serve();   // streame, rien n'est écrit sur disque
+    ->fallback($w, $h, '#e8e8e8')   // placeholder gris aux dimensions demandées
+    ->serve();                       // streame, rien n'est écrit sur disque
 ```
 
 ---
@@ -781,6 +890,32 @@ if (!userCanDownload($file['id'], $_SESSION['user_id'])) {
     ->fromPath($file['path'])
     ->checkMime(false)   // on fait confiance au fichier stocké
     ->serve(download: true, browserName: $file['original_name']);
+```
+
+---
+
+### PNG avec transparence → JPEG (fond personnalisé)
+
+```php
+// Logo PNG transparent converti en JPEG avec fond de marque
+$result = (new Uploader())
+    ->fromPath('/assets/logo-transparent.png')
+    ->resize(800, 400, ResizeMode::Fit)
+    ->noEnlarging()
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground('#0d1b2a')   // fond sombre de la charte graphique
+    ->jpegQuality(90)
+    ->process('/public/img/');
+
+// Variante fond blanc pour impression
+$result = (new Uploader())
+    ->fromPath('/assets/logo-transparent.png')
+    ->resize(800, 400, ResizeMode::Fit)
+    ->convertTo(ImageFormat::Jpeg)
+    ->flattenBackground('white')
+    ->jpegQuality(95)
+    ->setName('logo-print')
+    ->process('/public/img/');
 ```
 
 ---
@@ -869,6 +1004,8 @@ FlipDirection::Both         // Miroir dans les deux sens
 | `display(?string $name)` | Active le streaming inline après `process()` |
 | `download(?string $name)` | Active le force-download après `process()` |
 | `serve(?string $destDir, bool $download, ?string $name)` | Streame (+ sauvegarde optionnelle) |
+| `fallback(int $w, int $h, color)` | Configure le placeholder si source invalide |
+| `noFallback()` | Désactive le fallback pour cet appel |
 | `clean()` | Supprime le fichier temporaire (Base64/stream) |
 
 ### Nommage
@@ -910,6 +1047,7 @@ FlipDirection::Both         // Miroir dans les deux sens
 | Méthode | Description |
 |---------|-------------|
 | `convertTo(ImageFormat)` | Format de sortie |
+| `flattenBackground(string\|array)` | Fond pour conversion sans alpha (JPEG, BMP) |
 | `jpegQuality(int)` | Qualité JPEG (1–100) |
 | `jpegMaxSize(int\|string)` | Qualité JPEG auto pour taille cible |
 | `webpQuality(int)` | Qualité WebP (1–100) |
